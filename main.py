@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
 """
-Market Data API v2.1
-- GET /prices?coins=SEI,BTC,ETH          → Live Krypto via CMC
-- GET /stocks?tickers=AAPL,SAP.DE,GC=F   → Aktien, ETFs, Rohstoffe, Indizes via Yahoo Finance
-- GET /health                             → Server Status
+Market Data API v3.0
+- GET /prices?coins=SEI,BTC,ETH                    → Live Krypto via CMC
+- GET /stocks?tickers=AAPL,SAP.DE,GC=F,^GDAXI     → Aktien, ETFs, Rohstoffe, Forex via Alpha Vantage
+- GET /health                                       → Server Status
 """
 
 import os
 import time
 from datetime import datetime, timezone
-from functools import lru_cache
 
 import requests
-import yfinance as yf
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI(title="Market Data API", version="2.1.0")
+app = FastAPI(title="Market Data API", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -26,7 +24,10 @@ app.add_middleware(
 )
 
 CMC_API_KEY = os.environ.get("CMC_API_KEY", "")
-CMC_URL     = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest"
+AV_API_KEY  = os.environ.get("AV_API_KEY", "")
+
+CMC_URL = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest"
+AV_URL  = "https://www.alphavantage.co/query"
 
 # Simple in-memory cache: {ticker: (timestamp, data)}
 _stock_cache: dict = {}
@@ -93,72 +94,123 @@ def get_crypto_prices(coins: str = Query(..., example="SEI,BTC,ETH")):
 
 
 # ─────────────────────────────────────────────
-#  AKTIEN / ETFs / ROHSTOFFE / INDIZES (Yahoo)
+#  AKTIEN / ETFs / ROHSTOFFE / FOREX
+#  (Alpha Vantage)
 # ─────────────────────────────────────────────
-def _fetch_ticker(ticker: str) -> dict:
-    """Fetch single ticker with cache + retry."""
+
+# Alpha Vantage ticker mapping für Sonderfälle
+AV_TICKER_MAP = {
+    # Rohstoffe → Forex/Commodity Symbols
+    "GC=F":   ("GLOBAL_QUOTE", "GLD"),      # Gold ETF als Proxy
+    "SI=F":   ("GLOBAL_QUOTE", "SLV"),      # Silber ETF als Proxy
+    "BZ=F":   ("GLOBAL_QUOTE", "BNO"),      # Brent ETF als Proxy
+    "CL=F":   ("GLOBAL_QUOTE", "USO"),      # WTI ETF als Proxy
+    # Indizes → ETF Proxies
+    "^GSPC":  ("GLOBAL_QUOTE", "SPY"),      # S&P 500 → SPY
+    "^GDAXI": ("GLOBAL_QUOTE", "EWG"),      # DAX → iShares Germany ETF
+    "^NDX":   ("GLOBAL_QUOTE", "QQQ"),      # Nasdaq 100 → QQQ
+    "^DJI":   ("GLOBAL_QUOTE", "DIA"),      # Dow Jones → DIA
+    # Forex
+    "EURUSD=X": ("FX_INTRADAY", "EUR/USD"),
+    "GBPUSD=X": ("FX_INTRADAY", "GBP/USD"),
+    "USDJPY=X": ("FX_INTRADAY", "USD/JPY"),
+}
+
+def _fetch_av_quote(ticker: str) -> dict:
+    """Fetch single ticker from Alpha Vantage with cache."""
+    if not AV_API_KEY:
+        return {"error": "AV_API_KEY not configured"}
+
     now = time.time()
-
-    # Return cached value if fresh
     if ticker in _stock_cache:
-        ts, cached_data = _stock_cache[ticker]
+        ts, cached = _stock_cache[ticker]
         if now - ts < CACHE_TTL:
-            return cached_data
+            return cached
 
-    # Set User-Agent to avoid Yahoo rate limiting
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        )
-    })
+    # Determine function + symbol
+    mapped = AV_TICKER_MAP.get(ticker)
 
-    for attempt in range(3):
+    if mapped and mapped[0] == "FX_INTRADAY":
+        # Forex
+        from_currency, to_currency = mapped[1].split("/")
+        params = {
+            "function":      "CURRENCY_EXCHANGE_RATE",
+            "from_currency": from_currency,
+            "to_currency":   to_currency,
+            "apikey":        AV_API_KEY,
+        }
         try:
-            t    = yf.Ticker(ticker, session=session)
-            info = t.fast_info
-
-            price = getattr(info, "last_price", None)
-            if price is None:
-                return {"error": "no price data"}
-
-            prev_close = getattr(info, "previous_close", None)
-            currency   = getattr(info, "currency", "USD")
-            market_cap = getattr(info, "market_cap", None)
-            day_high   = getattr(info, "day_high", None)
-            day_low    = getattr(info, "day_low", None)
-            year_high  = getattr(info, "year_high", None)
-            year_low   = getattr(info, "year_low", None)
-
-            change_24h = None
-            if prev_close and prev_close != 0:
-                change_24h = round((price - prev_close) / prev_close * 100, 2)
-
-            data = {
-                "price":          round(price, 4),
-                "currency":       currency,
-                "change_24h_pct": change_24h,
-                "prev_close":     round(prev_close, 4) if prev_close else None,
-                "day_high":       round(day_high, 4)   if day_high   else None,
-                "day_low":        round(day_low, 4)    if day_low    else None,
-                "year_high":      round(year_high, 4)  if year_high  else None,
-                "year_low":       round(year_low, 4)   if year_low   else None,
-                "market_cap":     round(market_cap, 0) if market_cap else None,
+            resp = requests.get(AV_URL, params=params, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+            rate_data = data.get("Realtime Currency Exchange Rate", {})
+            price = float(rate_data.get("5. Exchange Rate", 0))
+            result = {
+                "price":          round(price, 6),
+                "currency":       to_currency,
+                "type":           "forex",
+                "from_currency":  from_currency,
+                "to_currency":    to_currency,
+                "last_refreshed": rate_data.get("6. Last Refreshed"),
             }
+        except Exception as e:
+            return {"error": str(e)}
 
-            # Store in cache
-            _stock_cache[ticker] = (time.time(), data)
-            return data
+    else:
+        # Stock / ETF / Index-Proxy
+        av_symbol = mapped[1] if mapped else ticker.replace(".DE", "")
+        # For German stocks, use the raw symbol (AV supports some)
+        if ticker.endswith(".DE"):
+            av_symbol = ticker  # Try with .DE first
+        params = {
+            "function": "GLOBAL_QUOTE",
+            "symbol":   av_symbol,
+            "apikey":   AV_API_KEY,
+        }
+        try:
+            resp = requests.get(AV_URL, params=params, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+
+            # Check for API limit message
+            if "Information" in data or "Note" in data:
+                msg = data.get("Information") or data.get("Note", "")
+                return {"error": f"API limit: {msg[:80]}"}
+
+            quote = data.get("Global Quote", {})
+            if not quote or not quote.get("05. price"):
+                return {"error": f"no data for {av_symbol}"}
+
+            price      = float(quote.get("05. price", 0))
+            prev_close = float(quote.get("08. previous close", 0))
+            change_pct = float(quote.get("10. change percent", "0%").replace("%", ""))
+            high       = float(quote.get("03. high", 0))
+            low        = float(quote.get("04. low", 0))
+            volume     = int(quote.get("06. volume", 0))
+            latest_day = quote.get("07. latest trading day")
+
+            proxy_note = None
+            if mapped:
+                proxy_note = f"Proxy ETF für {ticker}: {av_symbol}"
+
+            result = {
+                "price":          round(price, 4),
+                "currency":       "USD",
+                "change_24h_pct": round(change_pct, 2),
+                "prev_close":     round(prev_close, 4),
+                "day_high":       round(high, 4),
+                "day_low":        round(low, 4),
+                "volume":         volume,
+                "latest_day":     latest_day,
+            }
+            if proxy_note:
+                result["note"] = proxy_note
 
         except Exception as e:
-            if attempt < 2:
-                time.sleep(1 + attempt)  # 1s, 2s backoff
-            else:
-                return {"error": str(e)}
+            return {"error": str(e)}
 
-    return {"error": "failed after retries"}
+    _stock_cache[ticker] = (time.time(), result)
+    return result
 
 
 @app.get("/stocks")
@@ -166,19 +218,35 @@ def get_stock_prices(
     tickers: str = Query(
         ...,
         example="AAPL,SAP.DE,GC=F,^GDAXI,EURUSD=X",
+        description=(
+            "Kommagetrennte Ticker. Beispiele:\n"
+            "US-Aktien:  AAPL NVDA MSFT TSLA\n"
+            "DE-Aktien:  SAP.DE BMW.DE SIE.DE (limitierte AV-Unterstützung)\n"
+            "Rohstoffe:  GC=F (Gold/GLD) SI=F (Silber/SLV) BZ=F (Brent/BNO)\n"
+            "Indizes:    ^GSPC (SPY) ^GDAXI (EWG) ^NDX (QQQ)\n"
+            "Forex:      EURUSD=X GBPUSD=X USDJPY=X\n"
+            "⚠️ Free Plan: 25 Requests/Tag, 1 Req/min"
+        ),
     )
 ):
+    if not AV_API_KEY:
+        raise HTTPException(status_code=500, detail="AV_API_KEY not configured")
+
     ticker_list = [t.strip() for t in tickers.split(",") if t.strip()]
     if not ticker_list:
         raise HTTPException(status_code=400, detail="No valid tickers")
-    if len(ticker_list) > 30:
-        raise HTTPException(status_code=400, detail="Max 30 tickers per request")
+    if len(ticker_list) > 10:
+        raise HTTPException(status_code=400, detail="Max 10 tickers per request (Alpha Vantage free: 25 req/day)")
 
-    result = {ticker: _fetch_ticker(ticker) for ticker in ticker_list}
+    result = {}
+    for i, ticker in enumerate(ticker_list):
+        if i > 0:
+            time.sleep(1.2)  # Respect 1 req/min rate limit on free plan
+        result[ticker] = _fetch_av_quote(ticker)
 
     return {
         "timestamp": datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M:%S UTC"),
-        "source":    "Yahoo Finance (~15min Verzögerung während Handelszeiten)",
-        "note":      "Indizes: ^GDAXI=DAX ^GSPC=S&P500 ^NDX=Nasdaq100 | Rohstoffe: GC=F=Gold SI=F=Silber BZ=F=Brent | DE-Aktien: SAP.DE BMW.DE etc.",
+        "source":    "Alpha Vantage API",
+        "note":      "Rohstoffe & Indizes via ETF-Proxy | Free Plan: 25 req/Tag",
         "tickers":   result,
     }
