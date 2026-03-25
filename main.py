@@ -1,40 +1,209 @@
 """
-Railway Market Data Server — Updated Version
-Hybrid: yfinance (EU/Global) + Alpha Vantage (US Fallback)
- 
-Endpoints:
-  /stocks?tickers=RMS.PA,SAP.DE,AAPL,^GDAXI
-  /prices?coins=BTC,ETH,SEI   (CMC via bestehende Logik)
+Railway Market Data Server v4.0 — FastAPI + yfinance
+Kompatibel mit: uvicorn main:app --host 0.0.0.0 --port $PORT
 
-Ticker-Format:
-  US:       AAPL, MSFT, TSLA
-  Paris:    RMS.PA, AI.PA, BNP.PA
-  Xetra:    SAP.DE, BMW.DE
-  London:   SHEL.L, AZN.L
-  Milan:    ENI.MI
-  Madrid:   ITX.MC
-  Indizes:  ^GDAXI, ^GSPC, ^DJI
-  Gold:     GC=F
-  Silber:   SI=F
-  EUR/USD:  EURUSD=X
+Endpoints:
+  /stocks?tickers=RMS.PA,SAP.DE,AAPL,^GDAXI,GC=F,EURUSD=X
+  /prices?coins=BTC,ETH,SEI
+
+Quellen:
+  EU/Global/Indizes/FX/Futures → yfinance (Yahoo Finance, kostenlos, unlimitiert)
+  US-Aktien                    → Alpha Vantage (25 req/Tag Free Plan)
+  Krypto                       → CoinMarketCap Pro API
 """
 
 import os
-import json
 import time
 from datetime import datetime, timezone
-from flask import Flask, jsonify, request
-import yfinance as yf
+from typing import Optional
+
 import requests
+import yfinance as yf
+from fastapi import FastAPI, Query
+from fastapi.responses import JSONResponse
 
-app = Flask(__name__)
+app = FastAPI(title="Railway Market Data Server", version="4.0")
 
-# ── Konfiguration ──────────────────────────────────────────────────────────────
+# ── Env Vars ───────────────────────────────────────────────────────────────────
 ALPHA_VANTAGE_KEY = os.environ.get("ALPHA_VANTAGE_KEY", "")
 CMC_API_KEY       = os.environ.get("CMC_API_KEY", "")
 
-# Suffixe die yfinance nativ kennt (Euronext, Xetra, LSE, etc.)
+# ── Routing-Logik: yfinance vs. Alpha Vantage ─────────────────────────────────
 YFINANCE_SUFFIXES = {
+    ".PA", ".DE", ".L", ".MI", ".MC", ".AS", ".BR", ".VX",
+    ".VI", ".LI", ".IS", ".F", ".SG", ".HK", ".T", ".AX",
+    ".TO", ".SA", ".MX", ".KS", ".SS", ".SZ",
+}
+
+def uses_yfinance(ticker: str) -> bool:
+    """True wenn yfinance verwendet werden soll (EU/Global/Indizes/FX/Futures)."""
+    if ticker.startswith("^"):   # Indizes: ^GDAXI, ^GSPC, ^DJI
+        return True
+    if "=" in ticker:            # FX: EURUSD=X | Futures: GC=F, SI=F
+        return True
+    upper = ticker.upper()
+    for suffix in YFINANCE_SUFFIXES:
+        if upper.endswith(suffix.upper()):
+            return True
+    return False
+
+
+# ── yfinance Abruf ─────────────────────────────────────────────────────────────
+def fetch_yfinance(tickers: list[str]) -> dict:
+    result = {}
+    for ticker in tickers:
+        try:
+            info  = yf.Ticker(ticker).fast_info
+            price = float(info.last_price)     if info.last_price     else None
+            prev  = float(info.previous_close) if info.previous_close else None
+            currency = getattr(info, "currency", "EUR") or "EUR"
+            change_pct = round((price - prev) / prev * 100, 2) if price and prev and prev != 0 else None
+
+            result[ticker] = {
+                "price":          round(price, 4) if price else None,
+                "currency":       currency,
+                "change_24h_pct": change_pct,
+                "prev_close":     round(prev, 4) if prev else None,
+                "latest_day":     datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                "source":         "yfinance (Yahoo Finance)",
+            }
+        except Exception as e:
+            result[ticker] = {"error": str(e), "source": "yfinance"}
+    return result
+
+
+# ── Alpha Vantage Abruf (US-Aktien) ───────────────────────────────────────────
+def fetch_alpha_vantage(tickers: list[str]) -> dict:
+    result = {}
+    if not ALPHA_VANTAGE_KEY:
+        for t in tickers:
+            result[t] = {"error": "ALPHA_VANTAGE_KEY nicht gesetzt", "source": "alpha_vantage"}
+        return result
+
+    for ticker in tickers:
+        try:
+            url = (
+                f"https://www.alphavantage.co/query"
+                f"?function=GLOBAL_QUOTE&symbol={ticker}&apikey={ALPHA_VANTAGE_KEY}"
+            )
+            r    = requests.get(url, timeout=10)
+            data = r.json().get("Global Quote", {})
+
+            if not data:
+                result[ticker] = {"error": "Keine Daten von Alpha Vantage", "source": "alpha_vantage"}
+                continue
+
+            price      = float(data.get("05. price", 0))
+            prev_close = float(data.get("08. previous close", 0))
+            change_pct = float(data.get("10. change percent", "0%").replace("%", ""))
+
+            result[ticker] = {
+                "price":          round(price, 4),
+                "currency":       "USD",
+                "change_24h_pct": round(change_pct, 2),
+                "prev_close":     round(prev_close, 4),
+                "day_high":       float(data.get("03. high", 0)),
+                "day_low":        float(data.get("04. low", 0)),
+                "volume":         int(data.get("06. volume", 0)),
+                "latest_day":     data.get("07. latest trading day", ""),
+                "source":         "Alpha Vantage",
+            }
+        except Exception as e:
+            result[ticker] = {"error": str(e), "source": "alpha_vantage"}
+        time.sleep(0.2)
+
+    return result
+
+
+# ── Endpoints ──────────────────────────────────────────────────────────────────
+
+@app.get("/")
+def index():
+    return {
+        "name":    "Railway Market Data Server v4.0",
+        "endpoints": {
+            "/stocks": "?tickers=RMS.PA,SAP.DE,AAPL,^GDAXI,GC=F,EURUSD=X",
+            "/prices": "?coins=BTC,ETH,SEI",
+            "/health": "Statuscheck",
+        },
+        "sources": {
+            "EU/Global/Indizes/FX/Futures": "yfinance (Yahoo Finance, kostenlos)",
+            "US-Aktien":                    "Alpha Vantage (25 req/Tag Free Plan)",
+            "Krypto":                       "CoinMarketCap Pro API",
+        },
+    }
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "version": "4.0-yfinance"}
+
+
+@app.get("/stocks")
+def get_stocks(tickers: str = Query(..., description="Kommagetrennte Ticker: RMS.PA,SAP.DE,AAPL")):
+    ticker_list = [t.strip() for t in tickers.split(",") if t.strip()]
+    if not ticker_list:
+        return JSONResponse({"error": "Keine Ticker angegeben"}, status_code=400)
+
+    yf_tickers = [t for t in ticker_list if uses_yfinance(t)]
+    av_tickers = [t for t in ticker_list if not uses_yfinance(t)]
+
+    results = {}
+    if yf_tickers:
+        results.update(fetch_yfinance(yf_tickers))
+    if av_tickers:
+        results.update(fetch_alpha_vantage(av_tickers))
+
+    return {
+        "timestamp": datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M:%S UTC"),
+        "routing": {
+            "yfinance":      yf_tickers,
+            "alpha_vantage": av_tickers,
+        },
+        "tickers": results,
+    }
+
+
+@app.get("/prices")
+def get_crypto_prices(coins: str = Query(..., description="Kommagetrennte Coins: BTC,ETH,SEI")):
+    coin_list = [c.strip().upper() for c in coins.split(",") if c.strip()]
+    if not coin_list:
+        return JSONResponse({"error": "Keine Coins angegeben"}, status_code=400)
+
+    if not CMC_API_KEY:
+        return JSONResponse({"error": "CMC_API_KEY nicht gesetzt"}, status_code=500)
+
+    try:
+        url     = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest"
+        headers = {"X-CMC_PRO_API_KEY": CMC_API_KEY, "Accept": "application/json"}
+        params  = {"symbol": ",".join(coin_list), "convert": "USD"}
+        r       = requests.get(url, headers=headers, params=params, timeout=10)
+        data    = r.json().get("data", {})
+
+        result = {}
+        for coin in coin_list:
+            if coin in data:
+                q = data[coin]["quote"]["USD"]
+                result[coin] = {
+                    "price":          round(q["price"], 6),
+                    "change_1h":      round(q.get("percent_change_1h",  0), 2),
+                    "change_24h":     round(q.get("percent_change_24h", 0), 2),
+                    "change_7d":      round(q.get("percent_change_7d",  0), 2),
+                    "market_cap_usd": q.get("market_cap"),
+                    "volume_24h_usd": q.get("volume_24h"),
+                    "rank":           data[coin].get("cmc_rank"),
+                }
+            else:
+                result[coin] = {"error": "Nicht in CMC gefunden"}
+
+        return {
+            "timestamp": datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M:%S UTC"),
+            "source":    "CoinMarketCap Pro API (Live)",
+            "coins":     result,
+        }
+
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)YFINANCE_SUFFIXES = {
     ".PA", ".DE", ".L", ".MI", ".MC", ".AS", ".BR", ".VX",
     ".VI", ".LI", ".IS", ".F", ".SG", ".HK", ".T", ".AX",
     ".TO", ".SA", ".MX", ".KS", ".SS", ".SZ",
